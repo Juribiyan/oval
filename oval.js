@@ -31,88 +31,138 @@ var oval = {
 		'all_poly_options_failed': 'None of the requirements are met for polymorphic type',
 	},
 	interrupt: true,
+	// drop: in interrupt mode throws an error, otherwise pushes an error to the error array
 	drop: function(err) {
-		if(this.interrupt) { throw err }
+		if(this.interrupt) { throw err; }
 		else this.err.push(err);
 	},
 	match: function(sample, pattern, noint_pname) {
 		var self = this;
-		if(typeof noint_pname === 'undefined') noint_pnmame = false;
+		if(typeof noint_pname === 'undefined') noint_pname = false;
 		var propertyName;
 		if(typeof noint_pname === 'boolean') {
 			propertyName = '<root>';
 			self.interrupt = !noint_pname; 
 			self.err = [];
-			console.log('ROOT. Self interrupt is', self.interrupt, 'and self err is ', self.err);
+			// console.log('ROOT. Self interrupt is', self.interrupt, 'and self err is ', self.err);
 		}
 		else {
 			propertyName = noint_pname;
-			console.log('NEST. Property name is ', propertyName);
+			// console.log('NEST. Property name is ', propertyName);
 		}
 		function doSinglePattern(p) {
 			if(typeof p === 'string') {
-				if(self.types.hasOwnProperty(p)) var typeHandler = self.types[p].bind(self), props = {};
+				if(self.types.hasOwnProperty(p)) self.types[p].call(self, sample, {}, propertyName);
 				else this.drop({property: propertyName, errtype: 'unknown_type'});
 			}
-			else var typeHandler = self.types[p.type].bind(self), props = p;
-			typeHandler(sample, props, propertyName);
-		};
+			else self.types[p.type].call(self, sample, p, propertyName);
+		}
 		// pattern may be an array for a polymorphic type
 		if(pattern instanceof Array) {
 			var oneSuccess = false, poly_err = [];
+			var intmask = self.interrupt;
+			self.interrupt = true;
 			iter(pattern, function(poly_option) {
+				// console.log('poly option: ', poly_option, oneSuccess, poly_err);
 				if(!oneSuccess) {
 					try {
 						doSinglePattern(poly_option);
-						oneSuccess = true;		
+						oneSuccess = true;    
 					}
 					catch(e) {
 						poly_err.push(e);
-					}					
+					}         
 				}
-			})
-			if(!oneSuccess) this.drop({property: prop, errtype: 'all_poly_options_failed', data: polyErr});
+			});
+			self.interrupt = intmask;
+			// console.log('finally, os is ', oneSuccess)
+			if(!oneSuccess) self.drop({property: propertyName, errtype: 'all_poly_options_failed', data: poly_err});
 		}
 		else {
 			doSinglePattern(pattern);
 		}
-		return this.err;
+		return self.err;
 	},
 	types: {
 		object: function(sample, pattern, propertyName) {
+			var self = this;
 			var propNamePrefix = (propertyName !== '<root>') ? propertyName+' > ' : '';
-			var match = this.match.bind(this);
 			iter_obj(pattern.props, function(prop, directives) {
 				if(!sample.hasOwnProperty(prop) && !directives.optional)
-					this.drop({property: prop, errtype: 'prop_nonexist'});
+					self.drop({property: prop, errtype: 'prop_nonexist'});
 				else if(sample.hasOwnProperty(prop)) {
-					match(sample[prop], directives, propNamePrefix+prop);
+					self.match.call(self, sample[prop], directives, propNamePrefix+prop);
 				}
-			})
+			});
 		},
+		// for stringified objects. Parses JSON and passed all data to an "object" handler
 		json: function(sample, pattern, propertyName) {
-			try { var parsed = JSON.parse(sample); }
-			catch(e) { this.drop({property: propertyName, errtype: 'jsonparse_failed', original_error: e} ) }
-			this.types.object.bind(this)(parsed, pattern, propertyName);
+			var parsed;
+			try { parsed = JSON.parse(sample); }
+			catch(e) { this.drop({property: propertyName, errtype: 'jsonparse_failed', original_error: e} ); }
+			this.types.object.call(this, parsed, pattern, propertyName);
 		},
-		string: function(sample, pattern, prop) {
-			if(typeof sample !== 'string') this.drop({property: prop, errtype: 'wrong_type'});
-			if(pattern.hasOwnProperty('size')) {
-				if(pattern.size instanceof Array && pattern.size.length === 2) {
-					if(sample.length < pattern.size[0]) this.drop({property: prop, errtype: 'toosmall'});
-					if(sample.length > pattern.size[1]) this.drop({property: prop, errtype: 'toobig'});
+		string: function(sample, pattern, propertyName) {
+			var self = this;
+			// must be of string type
+			if(typeof sample !== 'string') self.drop({property: propertyName, errtype: 'wrong_type'});
+			// "size" directive: length of string
+			if(pattern.size) {
+				// "size" may be an array difining length range: [minlength, maxlength]..
+				if(pattern.size instanceof Array) {
+					if(sample.length < pattern.size[0]) self.drop({property: propertyName, errtype: 'toosmall'});
+					if(sample.length > pattern.size[1]) self.drop({property: propertyName, errtype: 'toobig'});
 				}
-				else if(sample.length !== pattern.size) this.drop({property: prop, errtype: 'size_notequal'});
+				// ..or it can be a number
+				else if(sample.length !== pattern.size) self.drop({property: propertyName, errtype: 'size_notequal'});
 			}
-			if(pattern.hasOwnProperty('whitelist') && !in_array(sample, pattern.whitelist)) this.drop({property: prop, errtype: 'not_in_whitelist'});
-			if(pattern.hasOwnProperty('partial_blacklist')) {
+			// "whitelist" directive: declares an list of allowed values
+			if(pattern.whitelist && !in_array(sample, pattern.whitelist)) self.drop({property: propertyName, errtype: 'not_in_whitelist'});
+			// "partial_blacklist" directive: declares a list of words that when found in a string lead to validation failure
+			if(pattern.partial_blacklist) {
 				iter(pattern.partial_blacklist, function(entry) {
-					if(sample.indexOf(entry) !== (-1)) this.drop({property: prop, errtype: 'blacklisted_fragment', fragment: entry });
-				})
+					if(sample.indexOf(entry) !== (-1)) self.drop({property: propertyName, errtype: 'blacklisted_fragment', fragment: entry });
+				});
 			}
-			if(pattern.hasOwnProperty('blacklist') && in_array(sample, pattern.blacklist)) this.drop({property: prop, errtype: 'in_blacklist'});
-			if(pattern.hasOwnProperty('equals') && sample !== pattern.equals) this.drop({property: prop, errtype: 'not_equals'});
-			if(pattern.hasOwnProperty('regex') && !(pattern.regex.test(sample))) this.drop({property: prop, errtype: 'regex_failed'});
+			// "blacklist" directive: declares a list of banned values (exact values this time)
+			if(pattern.blacklist && in_array(sample, pattern.blacklist)) self.drop({property: propertyName, errtype: 'in_blacklist'});
+			// "regex" directive: declares a regex (of an array of regexes) that our string must be tested against
+			if(pattern.regex) {
+				iter(pattern.regex, function(expr) {
+					if(!expr.text(sample)) self.drop({property: propertyName, errtype: 'regex_failed', expr: expr});
+				});
+			}
+			// "black_regex": regex-blacklist
+			if(pattern.black_regex) {
+				iter(pattern.regex, function(expr) {
+					if(expr.text(sample)) self.drop({property: propertyName, errtype: 'black_regex', expr: expr});
+				});
+			}
+		},
+		number: function(sample, pattern, propertyName) {
+			var self = this;
+			// "nostring" directive: if true, the value '42' (string) will not pass, otherwise it will
+			if(typeof sample !== 'number' && pattern.nostring) self.drop({property: propertyName, errtype: 'wrong_type'});
+			var radix = pattern.radix						// `radix` directive (self-explanatory)
+			, float = pattern.float || false		// `float` directive: will parse a number as float
+			, filter = pattern.filter || false	// `filter` directive: will parse decimal numbers strictly, no illegal characters allowed
+			, number;
+			if(filter) {
+				var expr = float ? /^(\-|\+)?([0-9]+(\.[0-9]+)?|Infinity)$/ : /^(\-|\+)?([0-9]+|Infinity)$/;
+				if(!expr.test(sample)) self.drop({property: propertyName, errtype: 'wrong_format'});
+				else number = Number(sample);
+			}
+			else number = float ? parseFloat(sample) : parseInt(sample, radix);
+			if(isNaN(number)) self.drop({property: propertyName, errtype: 'not_number'});
+			if(pattern.range) {
+				// a range which our number must fit
+				if(pattern.range instanceof Array) {
+					if(number < pattern.range[0]) self.drop({property: propertyName, errtype: 'toosmall'});
+					if(number > pattern.range[1]) self.drop({property: propertyName, errtype: 'toobig'});
+				}
+				//  if `range` directive is define as a single number, the number must be equal
+				else if(number != pattern.range) self.drop({property: propertyName, errtype: 'notequal'});
+			}
 		}
 	}
-}
+};
